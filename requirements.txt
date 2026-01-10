@@ -1,0 +1,11 @@
+# CAP Theorem Verification - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Azure Cosmos DB SDK
+azure-cosmos==4.6.0
+
+# Async support
+aiohttp>=3.8.0
+
+# Optional: For CLI tools
+click>=8.0.0
