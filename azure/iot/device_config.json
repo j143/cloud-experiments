@@ -1,0 +1,34 @@
+{
+  "hub_config": {
+    "connection_string": "HostName=iot-exp-hub.azure-devices.net;SharedAccessKeyName=owner;SharedAccessKey=<YOUR_SHARED_ACCESS_KEY>",
+    "hub_name": "iot-exp-hub"
+  },
+  "device_config": {
+    "device_id": "sensor-01",
+    "device_connection_string": "HostName=iot-exp-hub.azure-devices.net;DeviceId=sensor-01;SharedAccessKey=<YOUR_DEVICE_KEY>",
+    "authentication_type": "symmetric_key"
+  },
+  "telemetry": {
+    "interval_seconds": 5,
+    "message_format": "json",
+    "properties": {
+      "sensor_type": "temperature",
+      "location": "lab-1",
+      "device_version": "1.0"
+    }
+  },
+  "device_twin": {
+    "desired_properties": {
+      "telemetry_interval": 5,
+      "enabled": true
+    },
+    "reported_properties": {
+      "firmware_version": "1.0.0",
+      "model": "simulator-v1"
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "json"
+  }
+}
