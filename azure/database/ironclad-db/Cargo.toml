@@ -1,0 +1,26 @@
+[package]
+name = "ironclad-db"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+azure_storage_blobs = "0.21"
+azure_storage = "0.21"
+azure_core = "0.16"
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+parking_lot = "0.12"
+dashmap = "5.5"
+bytes = "1.5"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "ironclad"
+path = "src/main.rs"
