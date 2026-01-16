@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 
 const BUFFER_SIZE: usize = 50 * 1024 * 1024; // 50MB
 const PAGE_SIZE: usize = 4096; // 4KB per page
-const NUM_FRAMES: usize = BUFFER_SIZE / PAGE_SIZE; // 12,288 frames
+const NUM_FRAMES: usize = BUFFER_SIZE / PAGE_SIZE; // 12,800 frames
 
 /// Represents a single frame in the buffer pool
 #[derive(Debug, Clone)]
