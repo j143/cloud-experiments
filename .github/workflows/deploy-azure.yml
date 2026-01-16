@@ -1,0 +1,179 @@
+name: Deploy to Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: 'Azure Resource Group name'
+        required: true
+        default: 'cap-theorem-rg'
+        type: string
+
+      cosmos_account_name:
+        description: 'Cosmos DB Account name (must be globally unique)'
+        required: true
+        default: 'cosmos-cap-theorem'
+        type: string
+
+      database_name:
+        description: 'Database name'
+        required: true
+        default: 'cap-test-db'
+        type: string
+
+      container_name:
+        description: 'Container name'
+        required: true
+        default: 'cap-container'
+        type: string
+
+      primary_region:
+        description: 'Primary Azure region'
+        required: true
+        default: 'northeurope'
+        type: choice
+        options:
+          - northeurope
+          - westeurope
+          - eastus
+          - westus
+          - southeastasia
+          - japaneast
+
+      secondary_region:
+        description: 'Secondary Azure region for replication'
+        required: true
+        default: 'eastus'
+        type: choice
+        options:
+          - eastus
+          - westus
+          - northeurope
+          - westeurope
+          - southeastasia
+          - japaneast
+
+      throughput:
+        description: 'Provisioned throughput (RU/s)'
+        required: true
+        default: '400'
+        type: string
+
+      consistency_level:
+        description: 'Default consistency level'
+        required: true
+        default: 'Session'
+        type: choice
+        options:
+          - Strong
+          - BoundedStaleness
+          - Session
+          - ConsistentPrefix
+          - Eventual
+
+      enable_multi_write:
+        description: 'Enable multi-region writes'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Create Resource Group
+      run: |
+        az group create \
+          --name ${{ inputs.resource_group }} \
+          --location ${{ inputs.primary_region }}
+
+    - name: Create Cosmos DB Account
+      run: |
+        MULTI_WRITE=${{ inputs.enable_multi_write }}
+        az cosmosdb create \
+          --name ${{ inputs.cosmos_account_name }} \
+          --resource-group ${{ inputs.resource_group }} \
+          --locations regionName=${{ inputs.primary_region }} \
+            failoverPriority=0 \
+          --locations regionName=${{ inputs.secondary_region }} \
+            failoverPriority=1 \
+          --enable-multiple-write-locations ${MULTI_WRITE} \
+          --default-consistency-level ${{ inputs.consistency_level }}
+
+    - name: Create Database
+      run: |
+        az cosmosdb sql database create \
+          --account-name ${{ inputs.cosmos_account_name }} \
+          --resource-group ${{ inputs.resource_group }} \
+          --name ${{ inputs.database_name }} \
+          --throughput ${{ inputs.throughput }}
+
+    - name: Create Container
+      run: |
+        az cosmosdb sql container create \
+          --account-name ${{ inputs.cosmos_account_name }} \
+          --resource-group ${{ inputs.resource_group }} \
+          --database-name ${{ inputs.database_name }} \
+          --name ${{ inputs.container_name }} \
+          --partition-key-path /pk \
+          --throughput ${{ inputs.throughput }}
+
+    - name: Get Connection Key
+      id: get_key
+      run: |
+        KEY=$(az cosmosdb keys list \
+          --name ${{ inputs.cosmos_account_name }} \
+          --resource-group ${{ inputs.resource_group }} \
+          --type keys \
+          --query 'primaryMasterKey' \
+          -o tsv)
+        echo "::add-mask::$KEY"
+        echo "cosmos_key=$KEY" >> $GITHUB_OUTPUT
+
+    - name: Display Deployment Summary
+      run: |
+        echo "======================================="
+        echo "Azure Cosmos DB Deployment Complete!"
+        echo "======================================="
+        ENDPOINT="https://${{ inputs.cosmos_account_name }}"
+        ENDPOINT="${ENDPOINT}.documents.azure.com:443/"
+        echo "Endpoint: ${ENDPOINT}"
+        echo "Database: ${{ inputs.database_name }}"
+        echo "Container: ${{ inputs.container_name }}"
+        echo "Primary Region: ${{ inputs.primary_region }}"
+        echo "Secondary Region: ${{ inputs.secondary_region }}"
+        echo "Throughput: ${{ inputs.throughput }} RU/s"
+        echo "Consistency Level: ${{ inputs.consistency_level }}"
+        echo "Multi-Region Writes: ${{ inputs.enable_multi_write }}"
+        echo ""
+        echo "To run tests locally, set environment variables:"
+        echo "export COSMOS_ENDPOINT='${ENDPOINT}'"
+        echo "export COSMOS_KEY='<key-from-azure-portal>'"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run CAP Theorem Tests (Optional)
+      if: ${{ github.event.inputs.run_tests == 'true' }}
+      env:
+        COSMOS_ENDPOINT: >-
+          https://${{ inputs.cosmos_account_name }}.documents.azure.com:443/
+        COSMOS_KEY: ${{ steps.get_key.outputs.cosmos_key }}
+      run: |
+        python cap_test_simple.py

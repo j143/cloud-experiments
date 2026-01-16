@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Validate Python syntax
+      run: |
+        python -m py_compile cap_test_simple.py
+        python -m py_compile cap_measurement.py
+        python -m py_compile load_generator.py
+        python -m py_compile hybrid_consistency.py
+        python -m py_compile run_all_experiments.py
+
+    - name: Run pytest
+      run: |
+        pytest tests/ -v --tb=short
