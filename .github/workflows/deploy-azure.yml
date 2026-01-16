@@ -77,6 +77,12 @@ on:
         default: true
         type: boolean
 
+      run_tests:
+        description: 'Run CAP theorem tests after deployment'
+        required: false
+        default: false
+        type: boolean
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -98,7 +104,6 @@ jobs:
 
     - name: Create Cosmos DB Account
       run: |
-        MULTI_WRITE=${{ inputs.enable_multi_write }}
         az cosmosdb create \
           --name ${{ inputs.cosmos_account_name }} \
           --resource-group ${{ inputs.resource_group }} \
@@ -106,7 +111,7 @@ jobs:
             failoverPriority=0 \
           --locations regionName=${{ inputs.secondary_region }} \
             failoverPriority=1 \
-          --enable-multiple-write-locations ${MULTI_WRITE} \
+          --enable-multiple-write-locations ${{ inputs.enable_multi_write }} \
           --default-consistency-level ${{ inputs.consistency_level }}
 
     - name: Create Database

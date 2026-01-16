@@ -8,9 +8,6 @@ import sys
 import os
 from unittest.mock import Mock, patch, MagicMock
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 
 class TestCapTestSimple:
     """Tests for cap_test_simple.py"""
