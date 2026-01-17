@@ -17,8 +17,7 @@ COPY src ./src
 COPY tests ./tests
 
 # Build for release
-RUN cargo build --release --locked
-
+RUN cargo build --release
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
