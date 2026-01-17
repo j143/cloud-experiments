@@ -11,8 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests
-COPY Cargo.toml Cargo.lock ./
-
+COPY Cargo.toml ./
 # Copy source tree
 COPY src ./src
 COPY tests ./tests
