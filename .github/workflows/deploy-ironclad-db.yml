@@ -11,6 +11,9 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     
     steps:
       - name: Checkout code
@@ -19,79 +22,68 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push Docker image
+        working-directory: azure/database/ironclad-db
+        run: |
+          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/ironclad-db:${{ github.sha }}
+          IMAGE_NAME_LATEST=ghcr.io/${{ github.repository_owner }}/ironclad-db:latest
+          
+          docker build -t $IMAGE_NAME -t $IMAGE_NAME_LATEST .
+          docker push $IMAGE_NAME
+          docker push $IMAGE_NAME_LATEST
+          
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+      
       - name: Log in to Azure
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
       
-      - name: Log in to Azure Container Registry
-        run: |
-          az acr login --name ironcladadr
-      
-      - name: Get ACR credentials
-        id: acr-creds
-        run: |
-          ACR_USERNAME=$(az acr credential show --name ironcladadr --query 'username' -o tsv)
-          ACR_PASSWORD=$(az acr credential show --name ironcladadr --query 'passwords[0].value' -o tsv)
-          echo "::add-mask::$ACR_PASSWORD"
-          echo "username=$ACR_USERNAME" >> $GITHUB_OUTPUT
-          echo "password=$ACR_PASSWORD" >> $GITHUB_OUTPUT
-      
-      - name: Get Storage Account Key
+      - name: Get Storage Account key
         id: storage-key
         run: |
-          STORAGE_KEY=$(az storage account keys list -g ironclad-rg -n ironcladstor --query '[0].value' -o tsv)
-          echo "::add-mask::$STORAGE_KEY"
-          echo "key=$STORAGE_KEY" >> $GITHUB_OUTPUT
-      
-      - name: Build and push Docker image
-        working-directory: azure/database/ironclad-db
-        run: |
-          IMAGE_TAG="ironcladadr.azurecr.io/ironclad-db:${{ github.sha }}"
-          IMAGE_LATEST="ironcladadr.azurecr.io/ironclad-db:latest"
-          
-          docker build -t $IMAGE_TAG -t $IMAGE_LATEST .
-          docker push $IMAGE_TAG
-          docker push $IMAGE_LATEST
-          
-          echo "Built and pushed: $IMAGE_TAG"
-          echo "Built and pushed: $IMAGE_LATEST"
+          KEY=$(az storage account keys list --resource-group ironclad-rg --account-name ironcladsa --query '[0].value' -o tsv)
+          echo "::add-mask::$KEY"
+          echo "STORAGE_KEY=$KEY" >> $GITHUB_ENV
       
       - name: Delete existing container instance
         run: |
-          az container delete \
-            --resource-group ironclad-rg \
-            --name ironclad-db-prod \
-            --yes || echo "Container instance not found, continuing..."
+          az container delete --resource-group ironclad-rg --name ironclad-db-prod --yes || true
       
       - name: Deploy to Azure Container Instances
         run: |
           az container create \
             --resource-group ironclad-rg \
             --name ironclad-db-prod \
-            --image ironcladadr.azurecr.io/ironclad-db:latest \
-            --registry-login-server ironcladadr.azurecr.io \
-            --registry-username "${{ steps.acr-creds.outputs.username }}" \
-            --registry-password "${{ steps.acr-creds.outputs.password }}" \
-            --os-type Linux \
-            --cpu 2 \
-            --memory 2 \
+            --image ${{ env.IMAGE_NAME }} \
+            --registry-login-server ghcr.io \
+            --registry-username ${{ github.actor }} \
+            --registry-password ${{ secrets.GITHUB_TOKEN }} \
+            --cpu 1 \
+            --memory 1 \
+            --ports 80 \
+            --dns-name-label ironclad-db-demo \
             --environment-variables \
-              AZURE_STORAGE_ACCOUNT=ironcladstor \
-              AZURE_STORAGE_KEY="${{ steps.storage-key.outputs.key }}" \
-              RUST_LOG=info \
-            --ports 8080 \
-            --dns-name-label ironclad-db-prod
+              AZURE_STORAGE_ACCOUNT=ironcladsa \
+              AZURE_STORAGE_CONTAINER=ironclad-data \
+            --secure-environment-variables \
+              AZURE_STORAGE_KEY=${{ env.STORAGE_KEY }}
       
       - name: Get container FQDN
+        id: container-fqdn
         run: |
-          FQDN=$(az container show -g ironclad-rg -n ironclad-db-prod --query ipAddress.fqdn -o tsv)
-          echo "Container deployed at: $FQDN"
-          echo "Health check: curl http://$FQDN:8080/health"
+          FQDN=$(az container show --resource-group ironclad-rg --name ironclad-db-prod --query 'ipAddress.fqdn' -o tsv)
+          echo "Container URL: http://$FQDN"
+          echo "FQDN=$FQDN" >> $GITHUB_OUTPUT
       
       - name: Show container logs
         run: |
-          echo "Waiting for container to start..."
           sleep 10
-          echo "Container logs:"
-          az container logs -g ironclad-rg -n ironclad-db-prod || echo "Container still starting..."
+          az container logs --resource-group ironclad-rg --name ironclad-db-prod
