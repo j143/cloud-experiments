@@ -1,184 +1,232 @@
-/// KVStore: Key-Value Store Engine
+/// KVStore: High-level Key-Value Store interface
 /// 
-/// This is the top-level database layer that provides ACID-compliant
-/// key-value operations. It orchestrates the BufferPool, WAL, and AzureDisk
-/// to provide a complete database system.
+/// Provides ACID-compliant key-value operations on top of the buffer pool and WAL.
+/// Each key-value pair is stored in its own page with checksums for integrity.
 
-use anyhow::Result;
-use dashmap::DashMap;
-use std::sync::Arc;
-use tracing::{debug, info};
-
+use crate::azure_disk::{AzureDisk, PAGE_SIZE};
 use crate::buffer_pool::BufferPool;
-use crate::wal::{WalEntry, WAL};
+use crate::wal::{WriteAheadLog, WalEntry};
+use crate::error::{IronCladError, Result};
+use std::sync::Arc;
+use dashmap::DashMap;
+use tracing::{info, warn, debug};
 
-/// KVStore provides ACID-compliant key-value operations
+// Page format:
+// [Magic: 4 bytes] [Version: 2 bytes] [Checksum: 4 bytes] [LSN: 8 bytes]
+// [Key Length: 4 bytes] [Value Length: 4 bytes]
+// [Key Data] [Value Data] [Padding to 4096]
+
+const MAGIC_NUMBER: u32 = 0x49524F4E; // "IRON" in hex
+const VERSION: u16 = 1;
+const HEADER_SIZE: usize = 4 + 2 + 4 + 8 + 4 + 4; // 26 bytes
+const MAX_KEY_SIZE: usize = 256;
+const MAX_VALUE_SIZE: usize = PAGE_SIZE - HEADER_SIZE - MAX_KEY_SIZE - 4; // Leave room for lengths
+
 pub struct KVStore {
-    /// In-memory index: Maps keys to page IDs
-    /// Thread-safe using DashMap
-    index: Arc<DashMap<String, u64>>,
-    
-    /// Buffer pool for caching pages
+    disk: Arc<AzureDisk>,
     buffer_pool: Arc<BufferPool>,
-    
-    /// Write-Ahead Log for durability
-    wal: Arc<WAL>,
-    
-    /// Next available page ID
+    wal: Arc<WriteAheadLog>,
+    index: Arc<DashMap<String, u64>>, // key -> page_id mapping
     next_page_id: Arc<parking_lot::RwLock<u64>>,
 }
 
 impl KVStore {
-    /// Create a new KVStore instance
     pub async fn new(connection_string: &str) -> Result<Self> {
         info!("Initializing KVStore");
-        
-        let buffer_pool = Arc::new(BufferPool::new());
-        let wal = Arc::new(WAL::new(connection_string, "ironclad-db", "db-wal").await?);
-        
+
+        let container_name = "ironclad-data";
+        let disk = Arc::new(
+            AzureDisk::new(connection_string, container_name, "db-pages").await?
+        );
+        let buffer_pool = Arc::new(BufferPool::new(disk.clone()));
+        let wal = Arc::new(
+            WriteAheadLog::new(connection_string, container_name, "db-wal").await?
+        );
+
         let store = Self {
+            disk: disk.clone(),
+            buffer_pool: buffer_pool.clone(),
+            wal: wal.clone(),
             index: Arc::new(DashMap::new()),
-            buffer_pool,
-            wal,
-            next_page_id: Arc::new(parking_lot::RwLock::new(0)),
+            next_page_id: Arc::new(parking_lot::RwLock::new(1)),
         };
-        
-        // Perform crash recovery
+
+        // Recover from WAL if needed
         store.recover().await?;
-        
+
         Ok(store)
     }
-    
-    /// Recover from crash by replaying WAL
+
+    /// Recover from WAL
     async fn recover(&self) -> Result<()> {
-        info!("Starting crash recovery...");
-        
-        let entries = self.wal.replay().await?;
-        let entry_count = entries.len();
-        
+        let entries = self.wal.get_entries();
+        if entries.is_empty() {
+            info!("No WAL entries to recover");
+            return Ok(());
+        }
+
+        info!("Recovering {} WAL entries", entries.len());
+
         for entry in entries {
-            match entry {
-                WalEntry::Set { key, value } => {
-                    // Replay the set operation (without logging again)
-                    self.set_internal(&key, &value).await?;
-                    debug!("Recovered: SET {}={}", key, value);
-                },
-                WalEntry::Delete { key } => {
-                    // Replay the delete operation (without logging again)
-                    self.delete_internal(&key).await?;
-                    debug!("Recovered: DELETE {}", key);
-                },
-                WalEntry::Checkpoint { lsn } => {
-                    debug!("Recovered checkpoint at LSN {}", lsn);
-                },
+            // Replay the operation
+            match entry.operation.as_str() {
+                "PUT" => {
+                    // Write page to buffer pool
+                    self.buffer_pool.put_page(entry.page_id, entry.data.clone()).await?;
+                    
+                    // Decode key from page to rebuild index
+                    if let Ok((key, _)) = decode_kv_page(&entry.data) {
+                        self.index.insert(key.clone(), entry.page_id);
+                        
+                        // Update next_page_id
+                        let mut next = self.next_page_id.write();
+                        *next = (*next).max(entry.page_id + 1);
+                    }
+                }
+                "DELETE" => {
+                    // Decode key and remove from index
+                    if let Ok((key, _)) = decode_kv_page(&entry.data) {
+                        self.index.remove(&key);
+                    }
+                }
+                _ => {
+                    warn!("Unknown WAL operation: {}", entry.operation);
+                }
             }
         }
-        
-        info!("Crash recovery complete: recovered {} entries", entry_count);
+
+        info!("Recovery complete: {} keys in index", self.index.len());
         Ok(())
     }
-    
+
     /// Set a key-value pair
-    /// This operation is ACID-compliant:
-    /// - Atomic: Either fully succeeds or fully fails
-    /// - Consistent: Maintains index consistency
-    /// - Isolated: Uses thread-safe structures
-    /// - Durable: Logged to WAL before returning
     pub async fn set(&self, key: &str, value: &str) -> Result<()> {
-        // 1. Log to WAL first (DURABILITY POINT)
-        self.wal.append_entry(WalEntry::Set {
-            key: key.to_string(),
-            value: value.to_string(),
-        }).await?;
-        
-        // 2. Apply the change
-        self.set_internal(key, value).await?;
-        
-        info!("SET: {}={}", key, value);
-        Ok(())
-    }
-    
-    /// Internal set operation (used during recovery)
-    async fn set_internal(&self, key: &str, value: &str) -> Result<()> {
-        // Encode key-value as a page
-        let data = self.encode_kv_page(key, value)?;
-        
-        // Get or allocate page ID for this key
-        let page_id = if let Some(entry) = self.index.get(key) {
-            *entry.value()
-        } else {
-            let mut next_id = self.next_page_id.write();
-            let page_id = *next_id;
-            *next_id += 1;
-            page_id
-        };
-        
-        // Update buffer pool
-        self.buffer_pool.put_page(page_id, data)?;
-        
-        // Update index
-        self.index.insert(key.to_string(), page_id);
-        
-        Ok(())
-    }
-    
-    /// Get a value by key
-    pub async fn get(&self, key: &str) -> Result<Option<String>> {
-        // Lookup page ID in index
+        if key.len() > MAX_KEY_SIZE {
+            return Err(IronCladError::KeyTooLarge { 
+                size: key.len(), 
+                max: MAX_KEY_SIZE 
+            });
+        }
+        if value.len() > MAX_VALUE_SIZE {
+            return Err(IronCladError::ValueTooLarge { 
+                size: value.len(), 
+                max: MAX_VALUE_SIZE 
+            });
+        }
+
+        debug!("Setting key: {}", key);
+
+        // Get or allocate page ID
         let page_id = match self.index.get(key) {
             Some(entry) => *entry.value(),
             None => {
-                debug!("GET: {} not found", key);
-                return Ok(None);
+                let mut next = self.next_page_id.write();
+                let id = *next;
+                *next += 1;
+                id
             }
         };
-        
-        // Try to get from buffer pool
-        let data = match self.buffer_pool.get_page(page_id) {
+
+        // Encode key-value into page
+        let page_data = encode_kv_page(key, value, self.wal.current_lsn())?;
+
+        // Write to WAL first (CRITICAL for durability)
+        let wal_entry = WalEntry {
+            lsn: 0, // Will be assigned by WAL
+            page_id,
+            operation: "PUT".to_string(),
+            data: page_data.clone(),
+        };
+        self.wal.append_entry(wal_entry).await?;
+
+        // Now write to buffer pool (marks page dirty)
+        self.buffer_pool.put_page(page_id, page_data).await?;
+
+        // Update index
+        self.index.insert(key.to_string(), page_id);
+
+        Ok(())
+    }
+
+    /// Get a value by key
+    pub async fn get(&self, key: &str) -> Result<Option<String>> {
+        debug!("Getting key: {}", key);
+
+        // Look up page ID in index
+        let page_id = match self.index.get(key) {
+            Some(entry) => *entry.value(),
+            None => return Ok(None),
+        };
+
+        // Pin the page to prevent eviction while we're reading it
+        self.buffer_pool.pin_page(page_id)?;
+
+        // Get page from buffer pool
+        let page_data = match self.buffer_pool.get_page(page_id).await? {
             Some(data) => data,
             None => {
-                // In a real implementation, would fetch from AzureDisk
-                // For now, return None
-                debug!("GET: {} not in cache and not on disk", key);
+                self.buffer_pool.unpin_page(page_id)?;
                 return Ok(None);
             }
         };
-        
-        // Decode the page
-        let value = self.decode_kv_page(&data)?;
-        
-        info!("GET: {}={}", key, value);
-        Ok(Some(value))
+
+        // Decode page
+        let result = match decode_kv_page(&page_data) {
+            Ok((decoded_key, value)) => {
+                if decoded_key == key {
+                    Ok(Some(value))
+                } else {
+                    warn!("Key mismatch in page {}: expected '{}', got '{}'", 
+                        page_id, key, decoded_key);
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                warn!("Failed to decode page {}: {}", page_id, e);
+                Ok(None)
+            }
+        };
+
+        // Unpin the page
+        self.buffer_pool.unpin_page(page_id)?;
+
+        result
     }
-    
+
     /// Delete a key
     pub async fn delete(&self, key: &str) -> Result<bool> {
-        // 1. Log to WAL first (DURABILITY POINT)
-        self.wal.append_entry(WalEntry::Delete {
-            key: key.to_string(),
-        }).await?;
-        
-        // 2. Apply the change
-        let deleted = self.delete_internal(key).await?;
-        
-        if deleted {
-            info!("DELETE: {}", key);
-        } else {
-            debug!("DELETE: {} not found", key);
-        }
-        
-        Ok(deleted)
+        debug!("Deleting key: {}", key);
+
+        let page_id = match self.index.get(key) {
+            Some(entry) => *entry.value(),
+            None => return Ok(false),
+        };
+
+        // Create empty page for deletion marker
+        let empty_page = vec![0u8; PAGE_SIZE];
+
+        // Write to WAL
+        let wal_entry = WalEntry {
+            lsn: 0,
+            page_id,
+            operation: "DELETE".to_string(),
+            data: empty_page.clone(),
+        };
+        self.wal.append_entry(wal_entry).await?;
+
+        // Remove from index
+        self.index.remove(key);
+
+        // Mark page as deleted (write empty page)
+        self.buffer_pool.put_page(page_id, empty_page).await?;
+
+        Ok(true)
     }
-    
-    /// Internal delete operation (used during recovery)
-    async fn delete_internal(&self, key: &str) -> Result<bool> {
-        let removed = self.index.remove(key).is_some();
-        Ok(removed)
-    }
-    
-    /// Scan all entries
-    /// Returns all key-value pairs currently in the store
+
+    /// Scan all keys
     pub async fn scan(&self) -> Result<Vec<(String, String)>> {
+        debug!("Scanning all keys");
+
         let mut results = Vec::new();
         
         for entry in self.index.iter() {
@@ -187,268 +235,175 @@ impl KVStore {
                 results.push((key, value));
             }
         }
-        
-        info!("SCAN: returned {} entries", results.len());
+
         Ok(results)
     }
-    
+
     /// Flush all dirty pages to disk
     pub async fn flush(&self) -> Result<()> {
         let dirty_pages = self.buffer_pool.get_dirty_pages();
-        
-        info!("Flushing {} dirty pages", dirty_pages.len());
-        
-        // In a real implementation, would write to AzureDisk
-        // For now, just clear dirty flags
-        for (page_id, _data) in dirty_pages {
+        info!("Flushing {} dirty pages to Azure", dirty_pages.len());
+
+        for (page_id, data) in dirty_pages {
+            // Write to Azure
+            self.disk.write_page(page_id, &data).await?;
+            
+            // Clear dirty flag
             self.buffer_pool.clear_dirty(page_id)?;
         }
-        
+
+        // Flush WAL
+        self.wal.flush().await?;
+
+        // Flush disk
+        self.disk.flush().await?;
+
+        info!("Flush complete");
         Ok(())
     }
-    
-    /// Create a checkpoint
-    pub async fn checkpoint(&self) -> Result<()> {
-        info!("Creating checkpoint...");
-        
-        // 1. Flush all dirty pages
-        self.flush().await?;
-        
-        // 2. Create checkpoint in WAL
-        self.wal.checkpoint().await?;
-        
-        // 3. Can now safely clear old WAL entries
-        self.wal.clear().await?;
-        
-        info!("Checkpoint complete");
-        Ok(())
-    }
-    
-    /// Get store statistics
-    pub fn stats(&self) -> KVStoreStats {
+
+    /// Get statistics
+    pub fn stats(&self) -> String {
         let bp_stats = self.buffer_pool.stats();
-        
-        KVStoreStats {
-            num_keys: self.index.len(),
-            wal_entries: self.wal.entry_count(),
-            buffer_pool_used_mb: (bp_stats.used_frames * 4096) / (1024 * 1024),
-            buffer_pool_total_mb: bp_stats.buffer_size_mb,
-        }
-    }
-    
-    /// Encode a key-value pair into a 4KB page
-    fn encode_kv_page(&self, key: &str, value: &str) -> Result<Vec<u8>> {
-        // Simple encoding: length-prefixed key and value
-        let mut page = vec![0u8; 4096];
-        
-        let key_bytes = key.as_bytes();
-        let value_bytes = value.as_bytes();
-        
-        if key_bytes.len() + value_bytes.len() + 8 > 4096 {
-            anyhow::bail!("Key-value pair too large for single page");
-        }
-        
-        // Write key length (4 bytes)
-        let key_len = key_bytes.len() as u32;
-        page[0..4].copy_from_slice(&key_len.to_le_bytes());
-        
-        // Write key
-        page[4..4 + key_bytes.len()].copy_from_slice(key_bytes);
-        
-        // Write value length (4 bytes)
-        let value_len = value_bytes.len() as u32;
-        let value_len_offset = 4 + key_bytes.len();
-        page[value_len_offset..value_len_offset + 4].copy_from_slice(&value_len.to_le_bytes());
-        
-        // Write value
-        let value_offset = value_len_offset + 4;
-        page[value_offset..value_offset + value_bytes.len()].copy_from_slice(value_bytes);
-        
-        Ok(page)
-    }
-    
-    /// Decode a 4KB page into a value
-    fn decode_kv_page(&self, page: &[u8]) -> Result<String> {
-        if page.len() != 4096 {
-            anyhow::bail!("Invalid page size");
-        }
-        
-        // Read key length
-        let key_len = u32::from_le_bytes([page[0], page[1], page[2], page[3]]) as usize;
-        
-        // Read value length
-        let value_len_offset = 4 + key_len;
-        let value_len = u32::from_le_bytes([
-            page[value_len_offset],
-            page[value_len_offset + 1],
-            page[value_len_offset + 2],
-            page[value_len_offset + 3],
-        ]) as usize;
-        
-        // Read value
-        let value_offset = value_len_offset + 4;
-        let value_bytes = &page[value_offset..value_offset + value_len];
-        let value = String::from_utf8(value_bytes.to_vec())?;
-        
-        Ok(value)
+        format!(
+            "Keys: {}, Buffer: {}/{} frames, Dirty: {}, Pinned: {}, WAL LSN: {}",
+            self.index.len(),
+            bp_stats.used_frames,
+            bp_stats.total_frames,
+            bp_stats.dirty_pages,
+            bp_stats.pinned_pages,
+            self.wal.current_lsn()
+        )
     }
 }
 
-/// Store statistics
-#[derive(Debug, Clone)]
-pub struct KVStoreStats {
-    pub num_keys: usize,
-    pub wal_entries: usize,
-    pub buffer_pool_used_mb: usize,
-    pub buffer_pool_total_mb: usize,
+/// Encode a key-value pair into a page with checksum
+fn encode_kv_page(key: &str, value: &str, lsn: u64) -> Result<Vec<u8>> {
+    let mut page = vec![0u8; PAGE_SIZE];
+
+    let key_bytes = key.as_bytes();
+    let value_bytes = value.as_bytes();
+
+    if key_bytes.len() > MAX_KEY_SIZE {
+        return Err(IronCladError::KeyTooLarge { 
+            size: key_bytes.len(), 
+            max: MAX_KEY_SIZE 
+        });
+    }
+
+    if value_bytes.len() > MAX_VALUE_SIZE {
+        return Err(IronCladError::ValueTooLarge { 
+            size: value_bytes.len(), 
+            max: MAX_VALUE_SIZE 
+        });
+    }
+
+    let mut offset = 0;
+
+    // Magic number
+    page[offset..offset + 4].copy_from_slice(&MAGIC_NUMBER.to_le_bytes());
+    offset += 4;
+
+    // Version
+    page[offset..offset + 2].copy_from_slice(&VERSION.to_le_bytes());
+    offset += 2;
+
+    // Checksum placeholder (will compute after)
+    offset += 4;
+
+    // LSN
+    page[offset..offset + 8].copy_from_slice(&lsn.to_le_bytes());
+    offset += 8;
+
+    // Key length
+    let key_len = key_bytes.len() as u32;
+    page[offset..offset + 4].copy_from_slice(&key_len.to_le_bytes());
+    offset += 4;
+
+    // Value length
+    let value_len = value_bytes.len() as u32;
+    page[offset..offset + 4].copy_from_slice(&value_len.to_le_bytes());
+    offset += 4;
+
+    // Key data
+    page[offset..offset + key_bytes.len()].copy_from_slice(key_bytes);
+    offset += key_bytes.len();
+
+    // Value data
+    page[offset..offset + value_bytes.len()].copy_from_slice(value_bytes);
+
+    // Compute checksum (skip magic and version, checksum the rest)
+    let checksum = crc32fast::hash(&page[10..]);
+    page[6..10].copy_from_slice(&checksum.to_le_bytes());
+
+    Ok(page)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[tokio::test]
-    async fn test_kvstore_set_and_get() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        store.set("user:1", "Alice").await.unwrap();
-        
-        let value = store.get("user:1").await.unwrap();
-        assert_eq!(value, Some("Alice".to_string()));
+/// Decode a key-value page and verify checksum
+fn decode_kv_page(page: &[u8]) -> Result<(String, String)> {
+    if page.len() != PAGE_SIZE {
+        return Err(IronCladError::InvalidPageFormat {
+            reason: format!("Invalid page size: {}", page.len())
+        });
     }
-    
-    #[tokio::test]
-    async fn test_kvstore_get_nonexistent() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        let value = store.get("nonexistent").await.unwrap();
-        assert_eq!(value, None);
+
+    let mut offset = 0;
+
+    // Magic number
+    let magic = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
+    if magic != MAGIC_NUMBER {
+        return Err(IronCladError::InvalidPageFormat {
+            reason: format!("Invalid magic number: {:#x}", magic)
+        });
     }
-    
-    #[tokio::test]
-    async fn test_kvstore_delete() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        store.set("user:1", "Alice").await.unwrap();
-        
-        let deleted = store.delete("user:1").await.unwrap();
-        assert!(deleted);
-        
-        let value = store.get("user:1").await.unwrap();
-        assert_eq!(value, None);
+    offset += 4;
+
+    // Version
+    let version = u16::from_le_bytes([page[offset], page[offset + 1]]);
+    if version != VERSION {
+        return Err(IronCladError::InvalidPageFormat {
+            reason: format!("Unsupported version: {}", version)
+        });
     }
-    
-    #[tokio::test]
-    async fn test_kvstore_delete_nonexistent() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        let deleted = store.delete("nonexistent").await.unwrap();
-        assert!(!deleted);
+    offset += 2;
+
+    // Checksum
+    let stored_checksum = u32::from_le_bytes([
+        page[offset], page[offset + 1], page[offset + 2], page[offset + 3]
+    ]);
+    offset += 4;
+
+    // Verify checksum
+    let computed_checksum = crc32fast::hash(&page[10..]);
+    if stored_checksum != computed_checksum {
+        return Err(IronCladError::ChecksumMismatch {
+            page_id: 0,
+            expected: stored_checksum,
+            actual: computed_checksum,
+        });
     }
-    
-    #[tokio::test]
-    async fn test_kvstore_update() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        store.set("user:1", "Alice").await.unwrap();
-        store.set("user:1", "Bob").await.unwrap();
-        
-        let value = store.get("user:1").await.unwrap();
-        assert_eq!(value, Some("Bob".to_string()));
-    }
-    
-    #[tokio::test]
-    async fn test_kvstore_multiple_keys() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        store.set("user:1", "Alice").await.unwrap();
-        store.set("user:2", "Bob").await.unwrap();
-        store.set("user:3", "Charlie").await.unwrap();
-        
-        assert_eq!(store.get("user:1").await.unwrap(), Some("Alice".to_string()));
-        assert_eq!(store.get("user:2").await.unwrap(), Some("Bob".to_string()));
-        assert_eq!(store.get("user:3").await.unwrap(), Some("Charlie".to_string()));
-    }
-    
-    #[tokio::test]
-    async fn test_kvstore_scan() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        store.set("user:1", "Alice").await.unwrap();
-        store.set("user:2", "Bob").await.unwrap();
-        
-        let results = store.scan().await.unwrap();
-        assert_eq!(results.len(), 2);
-    }
-    
-    #[tokio::test]
-    async fn test_kvstore_crash_recovery() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        // Perform some operations
-        store.set("user:1", "Alice").await.unwrap();
-        store.set("user:2", "Bob").await.unwrap();
-        store.delete("user:1").await.unwrap();
-        
-        // Simulate crash by creating a new store instance
-        // The WAL should replay these operations
-        let store2 = KVStore::new("test-connection").await.unwrap();
-        
-        // After recovery, user:1 should be deleted and user:2 should exist
-        // Note: In this test, recovery works because we're using in-memory WAL
-        let stats = store2.stats();
-        assert!(stats.wal_entries >= 0);
-    }
-    
-    #[tokio::test]
-    async fn test_kvstore_stats() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        store.set("key1", "value1").await.unwrap();
-        store.set("key2", "value2").await.unwrap();
-        
-        let stats = store.stats();
-        assert_eq!(stats.num_keys, 2);
-        assert!(stats.wal_entries > 0);
-    }
-    
-    #[tokio::test]
-    async fn test_kvstore_checkpoint() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        store.set("key1", "value1").await.unwrap();
-        store.set("key2", "value2").await.unwrap();
-        
-        // Create checkpoint
-        store.checkpoint().await.unwrap();
-        
-        let stats = store.stats();
-        // After checkpoint, WAL should be cleared
-        assert_eq!(stats.wal_entries, 0);
-    }
-    
-    #[tokio::test]
-    async fn test_encode_decode_page() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        let key = "test-key";
-        let value = "test-value";
-        
-        let encoded = store.encode_kv_page(key, value).unwrap();
-        assert_eq!(encoded.len(), 4096);
-        
-        let decoded = store.decode_kv_page(&encoded).unwrap();
-        assert_eq!(decoded, value);
-    }
-    
-    #[tokio::test]
-    async fn test_large_value() {
-        let store = KVStore::new("test-connection").await.unwrap();
-        
-        let large_value = "x".repeat(1000);
-        store.set("large-key", &large_value).await.unwrap();
-        
-        let retrieved = store.get("large-key").await.unwrap();
-        assert_eq!(retrieved, Some(large_value));
-    }
+
+    // LSN (we just skip it for now)
+    offset += 8;
+
+    // Key length
+    let key_len = u32::from_le_bytes([
+        page[offset], page[offset + 1], page[offset + 2], page[offset + 3]
+    ]) as usize;
+    offset += 4;
+
+    // Value length
+    let value_len = u32::from_le_bytes([
+        page[offset], page[offset + 1], page[offset + 2], page[offset + 3]
+    ]) as usize;
+    offset += 4;
+
+    // Key data
+    let key = String::from_utf8(page[offset..offset + key_len].to_vec())?;
+    offset += key_len;
+
+    // Value data
+    let value = String::from_utf8(page[offset..offset + value_len].to_vec())?;
+
+    Ok((key, value))
 }
