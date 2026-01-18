@@ -7,6 +7,7 @@
 
 use azure_storage_blobs::prelude::*;
 use azure_storage::prelude::*;
+use azure_storage::CloudLocation;
 use crate::error::{IronCladError, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -39,7 +40,7 @@ impl WriteAheadLog {
     ) -> Result<Self> {
         info!("Initializing WAL with blob: {}", wal_blob_name);
 
-        // Parse connection string and create clients
+        // Parse connection string and create clients; support Azurite via BlobEndpoint
         let account_name = connection_string.split(';')
             .find(|s| s.starts_with("AccountName="))
             .and_then(|s| s.strip_prefix("AccountName="))
@@ -50,10 +51,32 @@ impl WriteAheadLog {
             .and_then(|s| s.strip_prefix("AccountKey="))
             .map(|s| s.to_string())
             .ok_or_else(|| IronCladError::ConfigError("Missing AccountKey in connection string".to_string()))?;
-        
-        let credentials = StorageCredentials::access_key(account_name.to_string(), account_key);
-        let blob_service_client = BlobServiceClient::new(account_name, credentials);
-        
+
+        let blob_endpoint = connection_string.split(';')
+            .find(|s| s.starts_with("BlobEndpoint="))
+            .and_then(|s| s.strip_prefix("BlobEndpoint="))
+            .map(|s| s.to_string());
+
+        let (credentials, cloud_location) = match blob_endpoint {
+            Some(uri) => (
+                StorageCredentials::emulator(),
+                CloudLocation::Custom {
+                    account: account_name.to_string(),
+                    uri,
+                },
+            ),
+            None => (
+                StorageCredentials::access_key(account_name.to_string(), account_key),
+                CloudLocation::Public {
+                    account: account_name.to_string(),
+                },
+            ),
+        };
+
+        let blob_service_client = BlobServiceClient::builder(account_name, credentials)
+            .cloud_location(cloud_location)
+            .blob_service_client();
+
         let container_client = blob_service_client.container_client(container_name);
 
         // Create container if it doesn't exist

@@ -6,6 +6,7 @@
 
 use azure_storage_blobs::prelude::*;
 use azure_storage::prelude::*;
+use azure_storage::CloudLocation;
 use crate::error::{IronCladError, Result};
 use std::sync::Arc;
 use tracing::{info, warn, debug};
@@ -19,8 +20,6 @@ const MAX_BLOB_SIZE: u64 = 1024 * 1024 * 1024 * 100; // 100GB initial size
 /// AzureDisk provides a block device abstraction over Azure Page Blobs
 pub struct AzureDisk {
     blob_client: Arc<BlobClient>,
-    container_client: Arc<ContainerClient>,
-    blob_name: String,
 }
 
 impl AzureDisk {
@@ -45,7 +44,7 @@ impl AzureDisk {
             ));
         }
 
-        // Parse connection string and create clients
+        // Parse connection string and create clients; support Azurite via BlobEndpoint
         let account_name = connection_string.split(';')
             .find(|s| s.starts_with("AccountName="))
             .and_then(|s| s.strip_prefix("AccountName="))
@@ -56,10 +55,32 @@ impl AzureDisk {
             .and_then(|s| s.strip_prefix("AccountKey="))
             .map(|s| s.to_string())
             .ok_or_else(|| IronCladError::ConfigError("Missing AccountKey in connection string".to_string()))?;
-        
-        let credentials = StorageCredentials::access_key(account_name.to_string(), account_key);
-        let blob_service_client = BlobServiceClient::new(account_name, credentials);
-        
+
+        let blob_endpoint = connection_string.split(';')
+            .find(|s| s.starts_with("BlobEndpoint="))
+            .and_then(|s| s.strip_prefix("BlobEndpoint="))
+            .map(|s| s.to_string());
+
+        let (credentials, cloud_location) = match blob_endpoint {
+            Some(uri) => (
+                StorageCredentials::emulator(),
+                CloudLocation::Custom {
+                    account: account_name.to_string(),
+                    uri,
+                },
+            ),
+            None => (
+                StorageCredentials::access_key(account_name.to_string(), account_key),
+                CloudLocation::Public {
+                    account: account_name.to_string(),
+                },
+            ),
+        };
+
+        let blob_service_client = BlobServiceClient::builder(account_name, credentials)
+            .cloud_location(cloud_location)
+            .blob_service_client();
+
         let container_client = blob_service_client.container_client(container_name);
 
         // Create container if it doesn't exist
@@ -91,8 +112,6 @@ impl AzureDisk {
 
         Ok(Self {
             blob_client: Arc::new(blob_client),
-            container_client: Arc::new(container_client),
-            blob_name: blob_name.to_string(),
         })
     }
 

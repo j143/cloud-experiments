@@ -29,8 +29,6 @@ pub struct BufferPool {
     page_table: Arc<RwLock<HashMap<u64, usize>>>,
     /// LRU queue for eviction
     lru_queue: Arc<RwLock<VecDeque<u64>>>,
-    /// Next frame to check for eviction (clock hand)
-    clock_hand: Arc<RwLock<usize>>,
 }
 
 impl BufferPool {
@@ -48,7 +46,6 @@ impl BufferPool {
             frames: Arc::new(RwLock::new(frames)),
             page_table: Arc::new(RwLock::new(HashMap::new())),
             lru_queue: Arc::new(RwLock::new(VecDeque::new())),
-            clock_hand: Arc::new(RwLock::new(0)),
         }
     }
 
