@@ -135,7 +135,7 @@ impl AzureDisk {
         
         let bytes = Bytes::copy_from_slice(data);
         
-        let range = BA512Range::new(offset, offset + PAGE_SIZE as u64)?;
+        let range = BA512Range::new(offset, offset + (PAGE_SIZE as u64) - 1)?;
         
         // update_pages takes u64 offset
         self.blob_client

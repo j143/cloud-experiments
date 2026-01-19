@@ -118,6 +118,15 @@ impl WAL {
         
         // Read the entire blob
         // For large logs, we should stream and parse line by line
+        
+        // First check properties to get size
+        let properties = self.blob_client.get_properties().await?;
+        if properties.blob.properties.content_length == 0 {
+            info!("WAL is empty, nothing to replay.");
+            *self.lsn.write() = 0;
+            return Ok(Vec::new());
+        }
+
         let mut stream = self.blob_client.get().into_stream();
         let mut buffer = Vec::new();
         
