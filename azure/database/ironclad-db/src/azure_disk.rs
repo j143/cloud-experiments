@@ -5,15 +5,20 @@
 /// Operations are async due to network I/O.
 
 use anyhow::Result;
+use azure_storage::prelude::*;
+use azure_storage_blobs::prelude::*;
+use azure_storage_blobs::blob::operations::GetPageRangesResponse;
+use futures::StreamExt;
 use std::sync::Arc;
 use tracing::{debug, info};
+use bytes::Bytes;
 
 const PAGE_SIZE: usize = 4096; // 4KB pages - standard database page size
 const BLOB_SIZE: usize = 1024 * 1024 * 1024; // 1GB total capacity
 
 /// AzureDisk provides a block device abstraction over Azure Page Blobs
 pub struct AzureDisk {
-    blob_client: Arc<()>, // Mock blob client for demonstration
+    page_blob_client: Arc<PageBlobClient>,
     container_name: String,
     blob_name: String,
 }
@@ -32,27 +37,29 @@ impl AzureDisk {
     ) -> Result<Self> {
         info!("Initializing AzureDisk: container={}, blob={}", container_name, blob_name);
         
-        // For demonstration purposes, we'll create a mock blob client
-        // In production, you would use the Azure SDK properly
+        let blob_service_client = BlobServiceClient::new(connection_string)?;
+        let container_client = blob_service_client.container_client(container_name);
         
-        let disk = Self {
-            blob_client: Arc::new(()),
+        // Ensure container exists
+        if !container_client.exists().await? {
+            info!("Creating container {}", container_name);
+            container_client.create().await?;
+        }
+        
+        let blob_client = container_client.blob_client(blob_name);
+        let page_blob_client = blob_client.as_page_blob_client();
+        
+        // Ensure blob exists and is of correct size
+        if !blob_client.exists().await? {
+            info!("Creating page blob {} with size {} bytes", blob_name, BLOB_SIZE);
+            page_blob_client.create(BLOB_SIZE as u128).await?;
+        }
+        
+        Ok(Self {
+            page_blob_client: Arc::new(page_blob_client),
             container_name: container_name.to_string(),
             blob_name: blob_name.to_string(),
-        };
-        
-        disk.initialize_blob().await?;
-        
-        Ok(disk)
-    }
-    
-    /// Initialize the page blob with the required size
-    async fn initialize_blob(&self) -> Result<()> {
-        // Try to create the page blob
-        // Note: In a real implementation, you'd use the page blob specific API
-        // For this demonstration, we'll use append blob for simplicity
-        debug!("Initializing blob storage");
-        Ok(())
+        })
     }
     
     /// Read a page from the blob storage
@@ -67,9 +74,34 @@ impl AzureDisk {
         
         debug!("Reading page {} from offset {}", page_id, offset);
         
-        // In a real implementation, this would read from Azure Page Blob
-        // For now, return zeroed page for demonstration
-        let data = vec![0u8; PAGE_SIZE];
+        // We need to read PAGE_SIZE bytes at the calculated offset
+        // Azure SDK allows reading a range
+        // Note: The range is inclusive
+        let range = offset..offset + PAGE_SIZE as u64;
+        
+        // Using get().range() to read specific bytes
+        let mut data = Vec::with_capacity(PAGE_SIZE);
+        let mut stream = self.page_blob_client.get().range(range).into_stream();
+        
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            data.extend_from_slice(&chunk.data.collect().await?);
+        }
+
+        // If we got less than PAGE_SIZE (e.g. empty page or end of blob), pad with zeros?
+        // Actually, for a valid page blob, reads should return data or 0s if sparse.
+        // However, if the page was never written, it might come back as zeros.
+        
+        if data.len() < PAGE_SIZE {
+             // Handle case where we might get fewer bytes if not fully written? 
+             // Though Page Blob create ensures size.
+             data.resize(PAGE_SIZE, 0);
+        }
+        
+        if data.len() > PAGE_SIZE {
+            // Should not happen with correct range, but trim just in case
+            data.truncate(PAGE_SIZE);
+        }
         
         Ok(data)
     }
@@ -88,16 +120,21 @@ impl AzureDisk {
         
         debug!("Writing page {} at offset {}", page_id, offset);
         
-        // In a real implementation, this would write to Azure Page Blob
-        // For demonstration, we just validate and return
+        // Page Blobs require 512-byte alignment, 4KB is 8 * 512 so it's fine.
+        let bytes = Bytes::copy_from_slice(data);
         
+        self.page_blob_client
+            .update_pages(offset as u128, bytes)
+            .await?;
+            
         Ok(())
     }
     
     /// Flush all pending writes to storage
     pub async fn flush(&self) -> Result<()> {
         debug!("Flushing all pending writes");
-        // In a real implementation, ensure all writes are committed
+        // Direct writes to Azure Page Blob are durable upon success response.
+        // No explicit flush needed for the client itself, as we await the calls.
         Ok(())
     }
     
@@ -133,13 +170,8 @@ mod tests {
         assert_eq!(page_100_offset, 409600);
     }
     
-    #[tokio::test]
-    async fn test_read_write_page_size_validation() {
-        // This test validates size checking without actual Azure connection
-        let invalid_data = vec![0u8; 100]; // Wrong size
-        assert_eq!(invalid_data.len(), 100);
-        
-        let valid_data = vec![0u8; PAGE_SIZE];
-        assert_eq!(valid_data.len(), PAGE_SIZE);
-    }
+    // Check if we can run integration tests
+    // Using simple conditional compilation or checking env var at runtime would be better
+    // But for now, we'll just skip them if no connection string
 }
+

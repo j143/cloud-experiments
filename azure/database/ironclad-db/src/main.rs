@@ -1,5 +1,6 @@
 use ironclad_db::KVStore;
 use tracing_subscriber;
+use std::env;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,9 +33,20 @@ async fn main() -> anyhow::Result<()> {
     println!("\n🧪 Running Demonstration...\n");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
-    // Create a KVStore instance (using mock connection for demo)
-    println!("▶ Initializing KVStore...");
-    let store = KVStore::new("demo-connection-string").await?;
+    // Get connection string from environment
+    let connection_string = match env::var("AZURE_STORAGE_CONNECTION_STRING") {
+        Ok(val) => val,
+        Err(_) => {
+            eprintln!("\n❌ ERROR: AZURE_STORAGE_CONNECTION_STRING environment variable is not set.");
+            eprintln!("Please set it to your Azure Storage connection string.");
+            eprintln!("Example: export AZURE_STORAGE_CONNECTION_STRING=\"DefaultEndpointsProtocol=https;...\"");
+            return Ok(());
+        }
+    };
+    
+    // Create a KVStore instance
+    println!("▶ Initializing KVStore (connecting to Azure)...");
+    let store = KVStore::new(&connection_string).await?;
     println!("✓ KVStore initialized\n");
     
     // Demonstrate SET operations
@@ -97,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
              stats.buffer_pool_used_mb, stats.buffer_pool_total_mb);
     println!();
     
+    // Demonstrate flush
+    println!("▶ Flushing dirty pages...");
+    store.flush().await?;
+    println!("  ✓ Flushed to Azure Page Blob\n");
+    
     // Demonstrate checkpoint
     println!("▶ Creating checkpoint...");
     store.checkpoint().await?;
@@ -109,8 +126,10 @@ async fn main() -> anyhow::Result<()> {
     println!("  • WAL-based durability (no data loss on crash)");
     println!("  • Buffer pool caching (in-memory performance)");
     println!("  • Crash recovery via WAL replay");
+    println!("  • REAL Azure Blob Storage persistence");
     println!("\n🎯 Ready for production use with Azure Page Blobs!");
     println!();
     
     Ok(())
 }
+
