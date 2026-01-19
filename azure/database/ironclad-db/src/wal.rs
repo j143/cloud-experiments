@@ -24,7 +24,7 @@ pub enum WalEntry {
 
 /// Write-Ahead Log implementation
 pub struct WAL {
-    append_blob_client: Arc<AppendBlobClient>,
+    blob_client: Arc<BlobClient>,
     
     /// Current log sequence number
     lsn: Arc<RwLock<u64>>,
@@ -43,7 +43,26 @@ impl WAL {
     ) -> Result<Self> {
         info!("Initializing WAL: container={}, blob={}", container_name, wal_blob_name);
         
-        let blob_service_client = BlobServiceClient::new(connection_string)?;
+        // Manual connection string parsing
+        let mut account_name = String::new();
+        let mut account_key = String::new();
+        
+        for part in connection_string.split(';') {
+            if let Some((key, value)) = part.split_once('=') {
+                match key {
+                    "AccountName" => account_name = value.to_string(),
+                    "AccountKey" => account_key = value.to_string(),
+                    _ => {}
+                }
+            }
+        }
+        
+        if account_name.is_empty() || account_key.is_empty() {
+             anyhow::bail!("Invalid connection string: missing AccountName or AccountKey");
+        }
+        
+        let creds = StorageCredentials::access_key(account_name.clone(), account_key);
+        let blob_service_client = BlobServiceClient::new(account_name, creds);
         let container_client = blob_service_client.container_client(container_name);
         
         // Ensure container exists
@@ -52,16 +71,16 @@ impl WAL {
         }
         
         let blob_client = container_client.blob_client(wal_blob_name);
-        let append_blob_client = blob_client.as_append_blob_client();
         
         // Ensure blob exists. For WAL, if it doesn't exist, create it.
         if !blob_client.exists().await? {
             info!("Creating WAL Append Blob: {}", wal_blob_name);
-            append_blob_client.create().await?;
+            // Use put_append_blob for Append Blobs
+            blob_client.put_append_blob().await?;
         }
         
         Ok(Self {
-            append_blob_client: Arc::new(append_blob_client),
+            blob_client: Arc::new(blob_client),
             lsn: Arc::new(RwLock::new(0)),
             container_name: container_name.to_string(),
             wal_blob_name: wal_blob_name.to_string(),
@@ -76,15 +95,13 @@ impl WAL {
         *lsn += 1;
         let current_lsn = *lsn;
         
-        // Serialize entry to JSON (simple, readable, debuggable)
-        // In production, might use binary format for efficiency
         let mut data = serde_json::to_vec(&entry)?;
         data.push(b'\n'); // Newline delimiter for stream reading
         
         let bytes = Bytes::from(data);
         
         // Append to Azure Blob
-        self.append_blob_client.append_block(bytes).await?;
+        self.blob_client.append_block(bytes).await?;
         
         debug!("WAL: Appended entry at LSN {}: {:?}", current_lsn, entry);
         
@@ -101,17 +118,19 @@ impl WAL {
         
         // Read the entire blob
         // For large logs, we should stream and parse line by line
-        // Azure SDK returns chunks
-        let mut stream = self.append_blob_client.get().into_stream();
+        let mut stream = self.blob_client.get().into_stream();
         let mut buffer = Vec::new();
         
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            buffer.extend_from_slice(&chunk.data.collect().await?);
+        while let Some(response_res) = stream.next().await {
+            let response = response_res?;
+            let mut body = response.data;
+            while let Some(chunk_res) = body.next().await {
+                let chunk: Bytes = chunk_res?;
+                buffer.extend_from_slice(&chunk);
+            }
         }
         
         // Parse the buffer
-        // Assuming newline aligned JSON
         let cursor = std::io::Cursor::new(buffer);
         let reader = std::io::BufReader::new(cursor);
         let deserializer = serde_json::Deserializer::from_reader(reader);
@@ -122,9 +141,6 @@ impl WAL {
             
             // Check if this is a checkpoint
             if let WalEntry::Checkpoint { lsn } = entry {
-                // If we hit a checkpoint, we technically only need entries after it
-                // But since we clear the WAL after checkpoint, any entries present ARE after checkpoint
-                // (except the checkpoint marker itself)
                  max_lsn = lsn;
             } else {
                  max_lsn += 1; // Approximate LSN reconstruction
@@ -147,8 +163,8 @@ impl WAL {
         info!("WAL: Clearing log after checkpoint");
         
         // Delete and recreate the blob to clear it
-        self.append_blob_client.delete().await?;
-        self.append_blob_client.create().await?;
+        self.blob_client.delete().await?;
+        self.blob_client.put_append_blob().await?;
         
         // Reset LSN
         *self.lsn.write() = 0;

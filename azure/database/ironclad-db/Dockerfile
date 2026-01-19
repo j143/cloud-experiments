@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for IronClad-DB
 # Stage 1: Builder
-FROM rust:1.92-slim as builder
+FROM rust:1.92-slim AS builder
 
 WORKDIR /app
 
@@ -16,8 +16,8 @@ COPY Cargo.toml ./
 COPY src ./src
 COPY tests ./tests
 
-# Build for release
-RUN cargo build --release
+# Build for debug
+RUN cargo build
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /app/target/release/ironclad .
+COPY --from=builder /app/target/debug/ironclad .
 
 # Set labels
 LABEL org.opencontainers.image.title="IronClad-DB"

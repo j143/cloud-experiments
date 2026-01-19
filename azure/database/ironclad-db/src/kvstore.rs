@@ -178,12 +178,6 @@ impl KVStore {
         // 1. Log to WAL first (DURABILITY POINT)
         self.wal.append_entry(WalEntry::Delete {
             key: key.to_string(),
-            value: value.to_string(), // Error: value not available here
-        }).await?; // Wait, Delete entry only has key. Let me fix the enum usage.
-        
-        // Fixed:
-        self.wal.append_entry(WalEntry::Delete {
-            key: key.to_string(),
         }).await?;
         
         // 2. Apply the change

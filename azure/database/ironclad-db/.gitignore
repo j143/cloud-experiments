@@ -4,3 +4,7 @@
 *.swo
 *~
 .DS_Store
+
+.env
+
+build_log*.txt
